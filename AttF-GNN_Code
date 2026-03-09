@@ -1,0 +1,322 @@
+import itertools
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
+from sklearn.neighbors import kneighbors_graph
+from sklearn.metrics import f1_score, confusion_matrix, classification_report
+
+from torch_geometric.utils import from_scipy_sparse_matrix, coalesce, sort_edge_index
+import torch_geometric.nn as pyg_nn
+
+
+# ======================================
+# Seed
+# ======================================
+SEED = 42
+np.random.seed(SEED)
+torch.manual_seed(SEED)
+
+
+# ======================================
+# Load Data
+# ======================================
+mirna_df  = pd.read_excel("mirna_final_gnn.xlsx")
+rnaseq_df = pd.read_excel("mrna_final_gnn.xlsx")
+dna_df    = pd.read_excel("dna_final_gnn.xlsx")
+
+mirna_df  = mirna_df.dropna().reset_index(drop=True)
+rnaseq_df = rnaseq_df.dropna().reset_index(drop=True)
+dna_df    = dna_df.dropna().reset_index(drop=True)
+
+mirna_df  = mirna_df.iloc[:,1:]
+rnaseq_df = rnaseq_df.iloc[:,1:]
+dna_df    = dna_df.iloc[:,1:]
+
+labels_np = mirna_df.iloc[:,-1].values.astype(int)
+
+mirna_features  = mirna_df.iloc[:,:-1].values
+rnaseq_features = rnaseq_df.iloc[:,:-1].values
+dna_features    = dna_df.iloc[:,:-1].values
+
+
+# ======================================
+# Feature Cleaning + Normalization
+# ======================================
+def clean_and_scale(X):
+
+    X = np.nan_to_num(X,nan=0.0,posinf=1e6,neginf=-1e6)
+
+    scaler = StandardScaler()
+
+    return scaler.fit_transform(X)
+
+
+mirna_features  = clean_and_scale(mirna_features)
+rnaseq_features = clean_and_scale(rnaseq_features)
+dna_features    = clean_and_scale(dna_features)
+
+
+# ======================================
+# Graph Construction
+# ======================================
+def build_edge_index(features,k):
+
+    knn = kneighbors_graph(
+        features,
+        k,
+        mode="connectivity",
+        metric="cosine",
+        include_self=False
+    )
+
+    edge_index,_ = from_scipy_sparse_matrix(knn)
+
+    edge_index = sort_edge_index(edge_index,sort_by_row=False)
+
+    return edge_index
+
+
+
+# Intersection Graph (at least in 2 modalities)
+
+def build_intersection_graph(edges_list,num_nodes):
+
+    edge_dict = {}
+
+    for edge in edges_list:
+
+        edge_np = edge.numpy()
+
+        for i in range(edge_np.shape[1]):
+
+            u = int(edge_np[0,i])
+            v = int(edge_np[1,i])
+
+            key = (u,v)
+
+            edge_dict[key] = edge_dict.get(key,0) + 1
+
+    final_edges = [k for k,v in edge_dict.items() if v >= 2]
+
+    edge_index = torch.tensor(final_edges,dtype=torch.long).t()
+
+    edge_index,_ = coalesce(edge_index,None,num_nodes=num_nodes)
+
+    edge_index = sort_edge_index(edge_index,sort_by_row=False)
+
+    return edge_index
+
+
+#
+class AttentionWeightedSumLayer(nn.Module):
+
+    def __init__(self,hidden_dim,num_modalities=3):
+
+        super().__init__()
+
+        self.scorers = nn.ModuleList(
+            [nn.Linear(hidden_dim,1,bias=False) for _ in range(num_modalities)]
+        )
+
+    def forward(self,hs):
+
+        pooled = [h.mean(dim=0) for h in hs]
+
+        scores = torch.stack(
+            [self.scorers[i](pooled[i]) for i in range(len(hs))],
+            dim=0
+        )
+
+        weights = torch.softmax(scores,dim=0)
+
+        fused = sum(weights[i]*hs[i] for i in range(len(hs)))
+
+        return fused,weights.squeeze(-1)
+
+
+
+class MultiModalGraphSAGE(nn.Module):
+
+    def __init__(self,input_dims,hidden_dim,num_classes,dropout):
+
+        super().__init__()
+
+        self.dropout = dropout
+
+        self.sage1_mirna = pyg_nn.SAGEConv(input_dims[0],hidden_dim,aggr="lstm")
+        self.sage1_rna   = pyg_nn.SAGEConv(input_dims[1],hidden_dim,aggr="lstm")
+        self.sage1_dna   = pyg_nn.SAGEConv(input_dims[2],hidden_dim,aggr="lstm")
+
+        self.fusion = AttentionWeightedSumLayer(hidden_dim,3)
+
+        self.sage2 = pyg_nn.SAGEConv(hidden_dim,hidden_dim,aggr="lstm")
+
+        self.fc = nn.Linear(hidden_dim,num_classes)
+
+    def forward(self,xs,edge_indices,intersection_edge):
+
+        h1 = F.relu(self.sage1_mirna(xs[0],edge_indices[0]))
+        h2 = F.relu(self.sage1_rna(xs[1],edge_indices[1]))
+        h3 = F.relu(self.sage1_dna(xs[2],edge_indices[2]))
+
+        h1 = F.dropout(h1,p=self.dropout,training=self.training)
+        h2 = F.dropout(h2,p=self.dropout,training=self.training)
+        h3 = F.dropout(h3,p=self.dropout,training=self.training)
+
+        h,weights = self.fusion([h1,h2,h3])
+
+        h = F.dropout(h,p=self.dropout,training=self.training)
+
+        h = F.relu(self.sage2(h,intersection_edge))
+
+        out = self.fc(h)
+
+        return out,weights
+
+
+
+idx = np.arange(len(labels_np))
+
+train_idx,test_idx = train_test_split(
+    idx,test_size=0.2,stratify=labels_np,random_state=SEED
+)
+
+train_idx,val_idx = train_test_split(
+    train_idx,test_size=0.125,stratify=labels_np[train_idx],random_state=SEED
+)
+
+train_idx = torch.tensor(train_idx)
+val_idx   = torch.tensor(val_idx)
+test_idx  = torch.tensor(test_idx)
+
+
+
+mirna_x = torch.tensor(mirna_features,dtype=torch.float32)
+rna_x   = torch.tensor(rnaseq_features,dtype=torch.float32)
+dna_x   = torch.tensor(dna_features,dtype=torch.float32)
+
+labels  = torch.tensor(labels_np,dtype=torch.long)
+
+num_classes = len(np.unique(labels_np))
+
+
+counts = np.bincount(labels_np)
+
+weights = len(labels_np)/(num_classes*counts)
+
+class_weights = torch.tensor(weights,dtype=torch.float32)
+
+
+
+def train_model(k=10,hidden=64,lr=1e-3,wd=1e-4,drop=0.2):
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    mirna_edge = build_edge_index(mirna_features,k)
+    rna_edge   = build_edge_index(rnaseq_features,k)
+    dna_edge   = build_edge_index(dna_features,k)
+
+    intersection_edge = build_intersection_graph(
+        [mirna_edge,rna_edge,dna_edge],
+        mirna_x.shape[0]
+    )
+
+    mx = mirna_x.to(device)
+    rx = rna_x.to(device)
+    dx = dna_x.to(device)
+    y  = labels.to(device)
+
+    me = mirna_edge.to(device)
+    re = rna_edge.to(device)
+    de = dna_edge.to(device)
+    ie = intersection_edge.to(device)
+
+    tr = train_idx.to(device)
+    va = val_idx.to(device)
+    te = test_idx.to(device)
+
+    cw = class_weights.to(device)
+
+    model = MultiModalGraphSAGE(
+        [mx.shape[1],rx.shape[1],dx.shape[1]],
+        hidden,
+        num_classes,
+        drop
+    ).to(device)
+
+    optimizer = optim.Adam(model.parameters(),lr=lr,weight_decay=wd)
+
+    loss_fn = nn.CrossEntropyLoss(weight=cw)
+
+    best_val = 0
+
+    for epoch in range(150):
+
+        model.train()
+
+        optimizer.zero_grad()
+
+        out,_ = model([mx,rx,dx],[me,re,de],ie)
+
+        loss = loss_fn(out[tr],y[tr])
+
+        loss.backward()
+
+        optimizer.step()
+
+        model.eval()
+
+        with torch.no_grad():
+
+            out,_ = model([mx,rx,dx],[me,re,de],ie)
+
+            pred = out.argmax(dim=1)
+
+            val_f1 = f1_score(
+                y[va].cpu(),
+                pred[va].cpu(),
+                average="macro"
+            )
+
+        if val_f1 > best_val:
+
+            best_val = val_f1
+            best_model = model.state_dict()
+
+    model.load_state_dict(best_model)
+
+    model.eval()
+
+    with torch.no_grad():
+
+        out,_ = model([mx,rx,dx],[me,re,de],ie)
+
+        pred = out.argmax(dim=1)
+
+        test_pred = pred[te].cpu().numpy()
+        test_true = y[te].cpu().numpy()
+
+        macro_f1 = f1_score(test_true,test_pred,average="macro")
+        weighted_f1 = f1_score(test_true,test_pred,average="weighted")
+
+        cm = confusion_matrix(test_true,test_pred)
+
+        print("\nConfusion Matrix\n")
+        print(cm)
+
+        print("\nClassification Report\n")
+        print(classification_report(test_true,test_pred,digits=4))
+
+        print("\nMacro F1:",macro_f1)
+        print("Weighted F1:",weighted_f1)
+
+    return macro_f1
+
+
+train_model()
